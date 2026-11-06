@@ -1,0 +1,1669 @@
+From cf9d2f18d3342d99e69fe570295f9c0febe2ebad Mon Sep 17 00:00:00 2001
+From: Mahran Rezk <mahranrezk10@gmail.com>
+Date: Thu, 8 Oct 2026 22:56:10 +0200
+Subject: [PATCH] Add passive input availability monitor (no output change)
+
+First step towards #4 (degraded-mode fallback). This commit only observes;
+synchronization, fusion and publishing are unchanged.
+
+- InputAvailabilityMonitor: per-input UNKNOWN/HEALTHY/STALE/RECOVERING and
+  aggregate NOMINAL/DEGRADED/INSUFFICIENT state derived from arrival times,
+  plus timing statistics (inter-arrival gaps, silences, detection latency,
+  recovery time, header stamp anomalies). Plain C++ without ROS types,
+  unit-tested with fake time.
+- One const arrival observer per input, registered before the synchronizer,
+  and a 10 ms evaluator timer on the node clock, created last in setup().
+- New read-only parameter degraded_mode.input_timeout (default 0.3 s,
+  provisional). Transitions and a periodic summary are logged at DEBUG
+  level only.
+- Declare message_filters as a dependency: the node header already includes
+  it directly, and the new test uses it.
+
+Tests: state machine unit tests, including a scripted trace checked against
+the reference model; message_filters tests showing that a const observer
+receives the published object itself (no copy) and does not change the
+ApproximateTime output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ point_cloud_fusion/CMakeLists.txt             |  12 +
+ point_cloud_fusion/README.md                  |   1 +
+ point_cloud_fusion/config/params.yml          |   2 +
+ .../point_cloud_fusion/input_availability.hpp | 358 ++++++++++++++++
+ .../point_cloud_fusion/point_cloud_fusion.hpp |  40 ++
+ point_cloud_fusion/package.xml                |   1 +
+ point_cloud_fusion/src/input_availability.cpp | 336 +++++++++++++++
+ point_cloud_fusion/src/point_cloud_fusion.cpp |  87 ++++
+ .../test/test_input_availability.cpp          | 383 ++++++++++++++++++
+ .../test/test_observer_no_copy.cpp            | 236 +++++++++++
+ 10 files changed, 1456 insertions(+)
+ create mode 100644 point_cloud_fusion/include/point_cloud_fusion/input_availability.hpp
+ create mode 100644 point_cloud_fusion/src/input_availability.cpp
+ create mode 100644 point_cloud_fusion/test/test_input_availability.cpp
+ create mode 100644 point_cloud_fusion/test/test_observer_no_copy.cpp
+
+diff --git a/point_cloud_fusion/CMakeLists.txt b/point_cloud_fusion/CMakeLists.txt
+index 33b8cbd..faf7a99 100644
+--- a/point_cloud_fusion/CMakeLists.txt
++++ b/point_cloud_fusion/CMakeLists.txt
+@@ -66,6 +66,7 @@ else()
+ endif()
+ 
+ find_package(ament_cmake REQUIRED)
++find_package(message_filters REQUIRED)
+ find_package(pcl_conversions REQUIRED)
+ find_package(pcl_ros REQUIRED)
+ find_package(point_cloud_transport REQUIRED)
+@@ -82,6 +83,7 @@ set(TARGET_NAME point_cloud_fusion_component)
+ # Source files
+ set(SOURCES
+   src/feature_calibration.cpp
++  src/input_availability.cpp
+   src/point_cloud_fusion.cpp
+ )
+ 
+@@ -118,6 +120,7 @@ target_include_directories(${TARGET_NAME} PUBLIC
+ target_compile_features(${TARGET_NAME} PUBLIC c_std_99 cxx_std_17)
+ 
+ ament_target_dependencies(${TARGET_NAME}
++  message_filters
+   pcl_conversions
+   pcl_ros
+   point_cloud_transport
+@@ -178,6 +181,15 @@ if(BUILD_TESTING)
+   )
+   target_include_directories(test_feature_calibration PRIVATE include)
+   ament_target_dependencies(test_feature_calibration sensor_msgs)
++
++  ament_add_gtest(test_input_availability
++    test/test_input_availability.cpp
++    src/input_availability.cpp
++  )
++  target_include_directories(test_input_availability PRIVATE include)
++
++  ament_add_gtest(test_observer_no_copy test/test_observer_no_copy.cpp)
++  ament_target_dependencies(test_observer_no_copy message_filters rclcpp sensor_msgs)
+ endif()
+ 
+ ament_package()
+diff --git a/point_cloud_fusion/README.md b/point_cloud_fusion/README.md
+index 19ed249..34a86c8 100644
+--- a/point_cloud_fusion/README.md
++++ b/point_cloud_fusion/README.md
+@@ -58,6 +58,7 @@ flowchart LR
+ | `range_limits.z_max` | `float` | `20.0` | Maximum z coordinate in target_frame to keep [m] |
+ | `max_time_diff_sec` | `float` | `0.05` | Maximum timestamp spread across a synchronized input batch in seconds |
+ | `age_penalty` | `float` | `0.1` | Age penalty used by the approximate-time synchronizer |
++| `degraded_mode.input_timeout` | `float` | `0.3` | Time without messages after which an input is considered unavailable [s]; currently only monitored, it does not change the output |
+ | `feature_calibration.enable` | `bool` | `false` | Continuously map follower feature distributions to the pooled, unchanged leader distribution |
+ | `feature_calibration.mode` | `string` | `"distribution"` | Calibration algorithm; currently only continuous distribution mapping is supported |
+ | `feature_calibration.field` | `string` | `"reflectivity"` | Scalar field to calibrate, typically reflectivity or intensity |
+diff --git a/point_cloud_fusion/config/params.yml b/point_cloud_fusion/config/params.yml
+index 24dfcb8..224561b 100644
+--- a/point_cloud_fusion/config/params.yml
++++ b/point_cloud_fusion/config/params.yml
+@@ -12,6 +12,8 @@
+     max_time_diff_sec: 0.05 # Maximum allowed timestamp difference (seconds) across inputs
+     output_queue_size: 10 # Queue depth for fused output publisher
+     age_penalty: 0.1 # Optional ApproximateTime tuning
++    degraded_mode:
++      input_timeout: 0.3 # [s] input considered unavailable after this silence; currently monitored only
+     use_cuda: true # Runtime-reconfigurable CPU/CUDA backend selection (requires CUDA build for true)
+     motion_compensation:
+       enable: false # Compensate sensor capture skew and motion during each rotating scan
+diff --git a/point_cloud_fusion/include/point_cloud_fusion/input_availability.hpp b/point_cloud_fusion/include/point_cloud_fusion/input_availability.hpp
+new file mode 100644
+index 0000000..86a4c01
+--- /dev/null
++++ b/point_cloud_fusion/include/point_cloud_fusion/input_availability.hpp
+@@ -0,0 +1,358 @@
++// Copyright Institute for Automotive Engineering (ika), RWTH Aachen University
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++
++namespace point_cloud_fusion {
++
++/**
++ * @brief Availability of a single input (layer 1), derived from message arrival times only.
++ */
++enum class InputAvailability : std::uint8_t {
++  kUnknown,     ///< No message since the current epoch started; counted as available during the startup grace.
++  kHealthy,     ///< Messages arrive within the input timeout.
++  kStale,       ///< No message for longer than the input timeout.
++  kRecovering,  ///< Messages arrive again after being stale; not yet counted as available.
++};
++
++/**
++ * @brief Aggregate availability over all inputs (layer 2).
++ */
++enum class AggregateAvailability : std::uint8_t {
++  kNominal,       ///< Every input is healthy or still unknown.
++  kDegraded,      ///< At least the minimum number of inputs is healthy or still unknown.
++  kInsufficient,  ///< Fewer than the minimum number of inputs is healthy or still unknown.
++};
++
++/**
++ * @brief Return a printable name for an input availability state.
++ *
++ * @param state Input availability state.
++ * @return Upper-case state name.
++ */
++const char* toString(InputAvailability state);
++
++/**
++ * @brief Return a printable name for an aggregate availability state.
++ *
++ * @param state Aggregate availability state.
++ * @return Upper-case state name.
++ */
++const char* toString(AggregateAvailability state);
++
++/**
++ * @brief Fixed-size histogram of non-negative durations with log-spaced buckets.
++ *
++ * Bucket k covers durations up to 1 us * 2^((k + 1) / 8), i.e. roughly 9 % resolution from 1 us to about
++ * 4.5 min; longer durations fall into the last bucket. The exact maximum, count and sum are tracked as well.
++ * Adding a sample never allocates.
++ */
++class DurationHistogram {
++ public:
++  /// Number of buckets per octave (factor of two).
++  static constexpr std::size_t kBucketsPerOctave = 8;
++  /// Total number of buckets.
++  static constexpr std::size_t kBucketCount = 224;
++
++  /**
++   * @brief Add one duration sample; negative durations are ignored.
++   *
++   * @param duration_ns Duration in nanoseconds.
++   */
++  void add(std::int64_t duration_ns);
++
++  /**
++   * @brief Number of samples added.
++   *
++   * @return Sample count.
++   */
++  std::uint64_t count() const { return count_; }
++
++  /**
++   * @brief Largest sample added, or 0 if there is none.
++   *
++   * @return Maximum duration in nanoseconds.
++   */
++  std::int64_t max() const { return max_ns_; }
++
++  /**
++   * @brief Mean of all samples, or 0 if there is none.
++   *
++   * @return Mean duration in nanoseconds.
++   */
++  double mean() const;
++
++  /**
++   * @brief Upper bound of the bucket that contains the q-quantile, capped at the exact maximum.
++   *
++   * @param q Quantile in [0, 1].
++   * @return Duration in nanoseconds, or 0 if there is no sample.
++   */
++  std::int64_t quantileUpperBound(double q) const;
++
++  /**
++   * @brief Upper bound of one bucket.
++   *
++   * @param bucket Bucket index.
++   * @return Duration in nanoseconds.
++   */
++  static std::int64_t bucketUpperBound(std::size_t bucket);
++
++  /**
++   * @brief Bucket index for a duration.
++   *
++   * @param duration_ns Non-negative duration in nanoseconds.
++   * @return Bucket index in [0, kBucketCount).
++   */
++  static std::size_t bucketIndex(std::int64_t duration_ns);
++
++ private:
++  std::array<std::uint64_t, kBucketCount> buckets_{};
++  std::uint64_t count_ = 0;
++  std::int64_t max_ns_ = 0;
++  double sum_ns_ = 0.0;
++};
++
++/**
++ * @brief Passive per-input availability monitor (layer 1 and layer 2) with E0 timing statistics.
++ *
++ * The monitor has no ROS dependencies: every time is passed in by the caller as nanoseconds of one clock
++ * (the node uses the ROS clock), so the state machine can be tested with fake time.
++ *
++ * Rules (absolute timeout T, startup grace T, 500 ms recovery window):
++ * - Arrival: UNKNOWN -> HEALTHY; STALE -> RECOVERING; RECOVERING -> HEALTHY once 500 ms have passed since
++ *   recovery started.
++ * - Tick: UNKNOWN -> STALE once the epoch is older than T; HEALTHY or RECOVERING -> STALE once the last arrival
++ *   is older than T; RECOVERING -> HEALTHY once 500 ms have passed since recovery started.
++ * - Aggregate: inputs that are HEALTHY or UNKNOWN count as available. All available -> NOMINAL, at least
++ *   minInputs() available -> DEGRADED, otherwise INSUFFICIENT.
++ *
++ * Time handling:
++ * - A backward jump is detected only in onTick(), against the previous tick, and resets the state to a new epoch.
++ * - onArrival() never resets. An arrival time earlier than the previous arrival (a race with another thread or a
++ *   jump not yet seen by a tick) is counted as a clamp and does not contribute a gap.
++ * - A time of 0 means that the clock has not started yet (ROS time without /clock). Arrivals at time 0 are counted
++ *   but otherwise ignored, and an epoch started at time 0 is re-anchored at the first non-zero time.
++ *
++ * Thread safety: all public member functions may be called concurrently. One internal mutex is held only for
++ * O(number of inputs) work and never while calling back into other code. Nothing allocates after construction.
++ */
++class InputAvailabilityMonitor {
++ public:
++  /// Maximum number of inputs supported.
++  static constexpr std::size_t kMaxInputs = 9;
++  /// Recovery window: a recovering input becomes healthy after receiving messages for this long.
++  static constexpr std::int64_t kRecoveryWindowNs = 500'000'000;
++  /// Capacity of the pending transition log; further transitions are counted as dropped.
++  static constexpr std::size_t kTransitionCapacity = 64;
++
++  /**
++   * @brief One state transition of an input or of the aggregate state.
++   */
++  struct Transition {
++    bool aggregate = false;                                                  ///< True for an aggregate (layer 2) transition.
++    std::size_t input = 0;                                                   ///< Input index (input transitions only).
++    InputAvailability input_from = InputAvailability::kUnknown;              ///< Previous input state.
++    InputAvailability input_to = InputAvailability::kUnknown;                ///< New input state.
++    AggregateAvailability aggregate_from = AggregateAvailability::kNominal;  ///< Previous aggregate state.
++    AggregateAvailability aggregate_to = AggregateAvailability::kNominal;    ///< New aggregate state.
++    std::int64_t time_ns = 0;                                                ///< Time of the transition.
++  };
++
++  /**
++   * @brief Caller-owned buffer that receives pending transitions.
++   */
++  struct TransitionLog {
++    std::array<Transition, kTransitionCapacity> records{};  ///< Transitions, oldest first.
++    std::size_t count = 0;                                  ///< Number of valid records.
++  };
++
++  /**
++   * @brief State and statistics of one input.
++   */
++  struct InputSnapshot {
++    InputAvailability state = InputAvailability::kUnknown;      ///< Current state.
++    std::int64_t last_arrival_ns = 0;                           ///< Last arrival time, 0 if none in this epoch.
++    std::uint64_t arrivals = 0;                                 ///< Arrivals counted (all epochs).
++    std::uint64_t arrivals_before_clock = 0;                    ///< Arrivals while the clock was at 0.
++    std::uint64_t arrival_clamps = 0;                           ///< Arrivals earlier than the previous arrival.
++    std::uint64_t stamp_zero = 0;                               ///< Messages with header stamp 0.
++    std::uint64_t stamp_regressions = 0;                        ///< Header stamp lower than the previous one.
++    std::uint64_t stamp_repeats = 0;                            ///< Header stamp equal to the previous one.
++    DurationHistogram normal_gap;                               ///< Gaps between arrivals that did not cross STALE.
++    DurationHistogram silence;                                  ///< Gaps between arrivals that crossed STALE.
++    DurationHistogram detect_latency;                           ///< Time from the last arrival to STALE.
++    DurationHistogram recovery_time;                            ///< Time from RECOVERING to HEALTHY.
++    DurationHistogram stamp_gap;                                ///< Positive header stamp increments.
++    std::array<std::array<std::uint64_t, 4>, 4> transitions{};  ///< Transition counts [from][to].
++  };
++
++  /**
++   * @brief Copy of the complete monitor state.
++   */
++  struct Snapshot {
++    std::size_t input_count = 0;                                          ///< Number of valid inputs.
++    std::size_t min_inputs = 0;                                           ///< Minimum for DEGRADED.
++    std::int64_t timeout_ns = 0;                                          ///< Input timeout T.
++    std::int64_t epoch_ns = 0;                                            ///< Start of the current epoch.
++    AggregateAvailability aggregate = AggregateAvailability::kNominal;    ///< Current aggregate state.
++    std::array<std::array<std::uint64_t, 3>, 3> aggregate_transitions{};  ///< Transition counts [from][to].
++    std::uint64_t time_jumps = 0;                                         ///< Backward jumps seen by onTick().
++    std::uint64_t transitions_dropped = 0;                                ///< Transitions lost to a full log.
++    DurationHistogram observer_cost;                                      ///< Cost of the arrival observer.
++    std::array<InputSnapshot, kMaxInputs> inputs{};                       ///< Per-input state.
++  };
++
++  /**
++   * @brief Create a monitor for a fixed number of inputs.
++   *
++   * The epoch starts at time 0, which means "not started"; call reset() with the current time.
++   *
++   * @param input_count Number of inputs, in [1, kMaxInputs].
++   * @param timeout_ns Input timeout T in nanoseconds, positive.
++   * @throws std::invalid_argument If an argument is out of range.
++   */
++  InputAvailabilityMonitor(std::size_t input_count, std::int64_t timeout_ns);
++
++  /**
++   * @brief Default minimum number of available inputs for DEGRADED: 1 for up to two inputs, otherwise half,
++   * rounded up.
++   *
++   * @param input_count Number of inputs.
++   * @return Minimum number of inputs.
++   */
++  static std::size_t defaultMinInputs(std::size_t input_count);
++
++  /**
++   * @brief Start a new epoch: every input becomes UNKNOWN and the startup grace restarts.
++   *
++   * Statistics are kept. A time of 0 defers the epoch start to the first non-zero time.
++   *
++   * @param now_ns Current time in nanoseconds.
++   */
++  void reset(std::int64_t now_ns);
++
++  /**
++   * @brief Record the arrival of one message.
++   *
++   * @param input Input index.
++   * @param now_ns Arrival time in nanoseconds.
++   * @param stamp_ns Header stamp of the message in nanoseconds (statistics only).
++   */
++  void onArrival(std::size_t input, std::int64_t now_ns, std::int64_t stamp_ns);
++
++  /**
++   * @brief Evaluate time-driven transitions; call periodically.
++   *
++   * @param now_ns Current time in nanoseconds.
++   */
++  void onTick(std::int64_t now_ns);
++
++  /**
++   * @brief Record the execution time of one arrival observer call.
++   *
++   * @param cost_ns Duration in nanoseconds (steady clock).
++   */
++  void recordObserverCost(std::int64_t cost_ns);
++
++  /**
++   * @brief Move pending transitions into a caller-owned log; transitions that did not fit were counted as dropped.
++   *
++   * @param log Log to fill; previous content is replaced.
++   */
++  void drainTransitions(TransitionLog& log);
++
++  /**
++   * @brief Copy the current state and statistics into a caller-owned snapshot.
++   *
++   * @param snapshot Snapshot to fill.
++   */
++  void snapshot(Snapshot& snapshot) const;
++
++  /**
++   * @brief Current state of one input.
++   *
++   * @param input Input index.
++   * @return Input state.
++   */
++  InputAvailability inputState(std::size_t input) const;
++
++  /**
++   * @brief Current aggregate state.
++   *
++   * @return Aggregate state.
++   */
++  AggregateAvailability aggregateState() const;
++
++ private:
++  /**
++   * @brief Per-input state and statistics.
++   */
++  struct InputRecord {
++    InputSnapshot data;              ///< State and statistics exposed in snapshots.
++    std::int64_t rec_since_ns = 0;   ///< Start of the current recovery.
++    std::int64_t last_stamp_ns = 0;  ///< Previous non-zero header stamp.
++    bool has_arrival = false;        ///< An arrival happened in this epoch.
++    bool has_stamp = false;          ///< last_stamp_ns is valid.
++  };
++
++  /**
++   * @brief Re-anchor an epoch that started before the clock was running.
++   *
++   * @param now_ns Current time in nanoseconds.
++   */
++  void anchorEpochLocked(std::int64_t now_ns);
++
++  /**
++   * @brief Change the state of one input and log the transition.
++   *
++   * @param input Input index.
++   * @param next New state.
++   * @param now_ns Time of the transition.
++   */
++  void setInputStateLocked(std::size_t input, InputAvailability next, std::int64_t now_ns);
++
++  /**
++   * @brief Recompute the aggregate state and log a transition if it changed.
++   *
++   * @param now_ns Time of the evaluation.
++   */
++  void updateAggregateLocked(std::int64_t now_ns);
++
++  /**
++   * @brief Append a transition to the pending log or count it as dropped.
++   *
++   * @param transition Transition to append.
++   */
++  void logTransitionLocked(const Transition& transition);
++
++  /**
++   * @brief Start a new epoch; see reset().
++   *
++   * @param now_ns Current time in nanoseconds.
++   */
++  void resetLocked(std::int64_t now_ns);
++
++  mutable std::mutex mutex_;
++  std::size_t input_count_;
++  std::size_t min_inputs_;
++  std::int64_t timeout_ns_;
++  std::int64_t epoch_ns_ = 0;
++  bool epoch_pending_ = true;
++  bool has_tick_ = false;
++  std::int64_t last_tick_ns_ = 0;
++  AggregateAvailability aggregate_ = AggregateAvailability::kNominal;
++  std::array<std::array<std::uint64_t, 3>, 3> aggregate_transitions_{};
++  std::uint64_t time_jumps_ = 0;
++  std::uint64_t transitions_dropped_ = 0;
++  DurationHistogram observer_cost_;
++  std::array<InputRecord, kMaxInputs> inputs_{};
++  TransitionLog pending_;
++};
++
++}  // namespace point_cloud_fusion
+diff --git a/point_cloud_fusion/include/point_cloud_fusion/point_cloud_fusion.hpp b/point_cloud_fusion/include/point_cloud_fusion/point_cloud_fusion.hpp
+index 4449907..f063beb 100644
+--- a/point_cloud_fusion/include/point_cloud_fusion/point_cloud_fusion.hpp
++++ b/point_cloud_fusion/include/point_cloud_fusion/point_cloud_fusion.hpp
+@@ -28,6 +28,7 @@
+ #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+ 
+ #include <point_cloud_fusion/feature_calibration.hpp>
++#include <point_cloud_fusion/input_availability.hpp>
+ #include <point_cloud_fusion/motion_compensation.hpp>
+ 
+ #ifdef ENABLE_CUDA
+@@ -129,6 +130,27 @@ class PointCloudFusion : public rclcpp::Node {
+ 
+   using PointCloudMsg = sensor_msgs::msg::PointCloud2;
+ 
++  /**
++   * @brief Record the arrival of one input message in the passive availability monitor.
++   *
++   * Registered on every input before any synchronizer callback, so it runs first for every message. It only
++   * reads the message and does O(1) work; it never changes what is synchronized or published.
++   *
++   * @param input Index of the input topic.
++   * @param msg Received point cloud.
++   */
++  void observeInputArrival(std::size_t input, const PointCloudMsg::ConstSharedPtr& msg);
++
++  /**
++   * @brief Periodic evaluation of the passive availability monitor; logs transitions and a summary at DEBUG level.
++   */
++  void evaluateInputAvailability();
++
++  /**
++   * @brief Log a DEBUG summary of the availability state and timing statistics of every input.
++   */
++  void logInputAvailabilitySummary();
++
+   /**
+    * @brief Timing metadata for one synchronized fusion batch.
+    */
+@@ -259,12 +281,18 @@ class PointCloudFusion : public rclcpp::Node {
+   static constexpr double kMaxRangeXY = 1000.0;
+   static constexpr double kMinRangeZ = -20.0;
+   static constexpr double kMaxRangeZ = 20.0;
++  static constexpr double kMinInputTimeoutSec = 0.01;
++  static constexpr double kMaxInputTimeoutSec = 10.0;
++  static constexpr std::chrono::milliseconds kAvailabilityEvaluationPeriod{10};
++  static constexpr std::int64_t kAvailabilitySummaryPeriodNs = 10'000'000'000;
++  static_assert(kMaxInputTopics <= InputAvailabilityMonitor::kMaxInputs, "availability monitor too small");
+ 
+   /**
+    * @brief ROS parameters
+    */
+   double max_time_diff_sec_ = 0.05;  // 50 ms default window
+   double age_penalty_ = 0.1;         // Matches message_filters::ApproximateTime default
++  double input_timeout_sec_ = 0.3;   // degraded_mode.input_timeout; provisional until measured
+   int64_t sync_queue_size_ = 3;      // queue size for synchronizer
+   int64_t output_queue_size_ = 10;   // queue size for output publisher
+   // Optional: limit each input cloud to this many points before processing.
+@@ -312,6 +340,18 @@ class PointCloudFusion : public rclcpp::Node {
+   std::vector<std::tuple<std::string, std::function<void(const rclcpp::Parameter&)>>> auto_reconfigurable_params_;
+   mutable std::shared_mutex config_mutex_;
+ 
++  /**
++   * @brief Passive input availability monitoring (no effect on the output).
++   *
++   * Declared before the subscribers so that it outlives the arrival observers registered on them.
++   */
++  std::unique_ptr<InputAvailabilityMonitor> availability_monitor_;
++  InputAvailabilityMonitor::TransitionLog availability_transitions_;
++  InputAvailabilityMonitor::Snapshot availability_snapshot_;
++  std::int64_t availability_last_summary_ns_ = 0;
++  rclcpp::CallbackGroup::SharedPtr availability_callback_group_;
++  rclcpp::TimerBase::SharedPtr availability_timer_;
++
+   std::vector<std::shared_ptr<point_cloud_transport::SubscriberFilter>> cloud_subscribers_;
+   std::vector<rclcpp::CallbackGroup::SharedPtr> cloud_subscriber_callback_groups_;
+   std::shared_ptr<void> synchronizer_;
+diff --git a/point_cloud_fusion/package.xml b/point_cloud_fusion/package.xml
+index bd6241b..e35bcf4 100644
+--- a/point_cloud_fusion/package.xml
++++ b/point_cloud_fusion/package.xml
+@@ -15,6 +15,7 @@
+ 
+   <buildtool_depend>ament_cmake</buildtool_depend>
+ 
++  <depend>message_filters</depend>
+   <depend>pcl_conversions</depend>
+   <depend>pcl_ros</depend>
+   <depend>point_cloud_transport</depend>
+diff --git a/point_cloud_fusion/src/input_availability.cpp b/point_cloud_fusion/src/input_availability.cpp
+new file mode 100644
+index 0000000..e2e31c0
+--- /dev/null
++++ b/point_cloud_fusion/src/input_availability.cpp
+@@ -0,0 +1,336 @@
++// Copyright Institute for Automotive Engineering (ika), RWTH Aachen University
++// SPDX-License-Identifier: Apache-2.0
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++
++#include <point_cloud_fusion/input_availability.hpp>
++
++namespace point_cloud_fusion {
++
++namespace {
++
++/// Lower edge of the first histogram bucket.
++constexpr double kHistogramBaseNs = 1000.0;
++
++}  // namespace
++
++const char* toString(const InputAvailability state) {
++  switch (state) {
++    case InputAvailability::kUnknown:
++      return "UNKNOWN";
++    case InputAvailability::kHealthy:
++      return "HEALTHY";
++    case InputAvailability::kStale:
++      return "STALE";
++    case InputAvailability::kRecovering:
++      return "RECOVERING";
++  }
++  return "INVALID";
++}
++
++const char* toString(const AggregateAvailability state) {
++  switch (state) {
++    case AggregateAvailability::kNominal:
++      return "NOMINAL";
++    case AggregateAvailability::kDegraded:
++      return "DEGRADED";
++    case AggregateAvailability::kInsufficient:
++      return "INSUFFICIENT";
++  }
++  return "INVALID";
++}
++
++std::size_t DurationHistogram::bucketIndex(const std::int64_t duration_ns) {
++  const double ratio = static_cast<double>(duration_ns) / kHistogramBaseNs;
++  if (ratio <= 1.0) {
++    return 0;
++  }
++  const double position = std::floor(static_cast<double>(kBucketsPerOctave) * std::log2(ratio));
++  return std::min(static_cast<std::size_t>(position), kBucketCount - 1);
++}
++
++std::int64_t DurationHistogram::bucketUpperBound(const std::size_t bucket) {
++  const double exponent = static_cast<double>(bucket + 1) / static_cast<double>(kBucketsPerOctave);
++  return static_cast<std::int64_t>(std::ceil(kHistogramBaseNs * std::exp2(exponent)));
++}
++
++void DurationHistogram::add(const std::int64_t duration_ns) {
++  if (duration_ns < 0) {
++    return;
++  }
++  ++buckets_.at(bucketIndex(duration_ns));
++  ++count_;
++  max_ns_ = std::max(max_ns_, duration_ns);
++  sum_ns_ += static_cast<double>(duration_ns);
++}
++
++double DurationHistogram::mean() const { return count_ == 0 ? 0.0 : sum_ns_ / static_cast<double>(count_); }
++
++std::int64_t DurationHistogram::quantileUpperBound(const double q) const {
++  if (count_ == 0) {
++    return 0;
++  }
++  const double clamped = std::clamp(q, 0.0, 1.0);
++  const auto target = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(std::ceil(clamped * static_cast<double>(count_))));
++  std::uint64_t cumulative = 0;
++  for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket) {
++    cumulative += buckets_.at(bucket);
++    if (cumulative >= target) {
++      return std::min(bucketUpperBound(bucket), max_ns_);
++    }
++  }
++  return max_ns_;
++}
++
++InputAvailabilityMonitor::InputAvailabilityMonitor(const std::size_t input_count, const std::int64_t timeout_ns)
++    : input_count_(input_count), min_inputs_(defaultMinInputs(input_count)), timeout_ns_(timeout_ns) {
++  if (input_count == 0 || input_count > kMaxInputs) {
++    throw std::invalid_argument("InputAvailabilityMonitor: input_count must be in [1, 9]");
++  }
++  if (timeout_ns <= 0) {
++    throw std::invalid_argument("InputAvailabilityMonitor: timeout_ns must be positive");
++  }
++}
++
++std::size_t InputAvailabilityMonitor::defaultMinInputs(const std::size_t input_count) {
++  if (input_count <= 2) {
++    return 1;
++  }
++  return (input_count + 1) / 2;
++}
++
++void InputAvailabilityMonitor::reset(const std::int64_t now_ns) {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  resetLocked(now_ns);
++}
++
++void InputAvailabilityMonitor::onArrival(const std::size_t input, const std::int64_t now_ns, const std::int64_t stamp_ns) {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  if (input >= input_count_) {
++    return;
++  }
++  InputRecord& record = inputs_.at(input);
++  InputSnapshot& data = record.data;
++  ++data.arrivals;
++  if (now_ns == 0) {
++    ++data.arrivals_before_clock;
++    return;
++  }
++  anchorEpochLocked(now_ns);
++
++  // Header stamps feed statistics only; they never influence availability.
++  if (stamp_ns == 0) {
++    ++data.stamp_zero;
++  } else {
++    if (record.has_stamp) {
++      const std::int64_t stamp_delta = stamp_ns - record.last_stamp_ns;
++      if (stamp_delta > 0) {
++        data.stamp_gap.add(stamp_delta);
++      } else if (stamp_delta == 0) {
++        ++data.stamp_repeats;
++      } else {
++        ++data.stamp_regressions;
++      }
++    }
++    record.last_stamp_ns = stamp_ns;
++    record.has_stamp = true;
++  }
++
++  // Arrival gaps: a gap that ends while the input is STALE is a silence, every other gap is a normal gap.
++  if (!record.has_arrival) {
++    record.has_arrival = true;
++    data.last_arrival_ns = now_ns;
++  } else if (now_ns < data.last_arrival_ns) {
++    ++data.arrival_clamps;
++  } else {
++    const std::int64_t gap_ns = now_ns - data.last_arrival_ns;
++    if (data.state == InputAvailability::kStale) {
++      data.silence.add(gap_ns);
++    } else {
++      data.normal_gap.add(gap_ns);
++    }
++    data.last_arrival_ns = now_ns;
++  }
++
++  switch (data.state) {
++    case InputAvailability::kUnknown:
++      setInputStateLocked(input, InputAvailability::kHealthy, now_ns);
++      break;
++    case InputAvailability::kStale:
++      record.rec_since_ns = now_ns;
++      setInputStateLocked(input, InputAvailability::kRecovering, now_ns);
++      break;
++    case InputAvailability::kRecovering:
++      if (now_ns - record.rec_since_ns >= kRecoveryWindowNs) {
++        data.recovery_time.add(now_ns - record.rec_since_ns);
++        setInputStateLocked(input, InputAvailability::kHealthy, now_ns);
++      }
++      break;
++    case InputAvailability::kHealthy:
++      break;
++  }
++  updateAggregateLocked(now_ns);
++}
++
++void InputAvailabilityMonitor::onTick(const std::int64_t now_ns) {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  if (now_ns == 0) {
++    return;
++  }
++  if (has_tick_ && now_ns < last_tick_ns_) {
++    ++time_jumps_;
++    resetLocked(now_ns);
++    has_tick_ = true;
++    last_tick_ns_ = now_ns;
++    return;
++  }
++  has_tick_ = true;
++  last_tick_ns_ = now_ns;
++  anchorEpochLocked(now_ns);
++
++  for (std::size_t input = 0; input < input_count_; ++input) {
++    InputRecord& record = inputs_.at(input);
++    InputSnapshot& data = record.data;
++    switch (data.state) {
++      case InputAvailability::kUnknown:
++        if (now_ns - epoch_ns_ > timeout_ns_) {
++          setInputStateLocked(input, InputAvailability::kStale, now_ns);
++        }
++        break;
++      case InputAvailability::kHealthy:
++      case InputAvailability::kRecovering:
++        if (now_ns - data.last_arrival_ns > timeout_ns_) {
++          data.detect_latency.add(now_ns - data.last_arrival_ns);
++          setInputStateLocked(input, InputAvailability::kStale, now_ns);
++        } else if (data.state == InputAvailability::kRecovering && now_ns - record.rec_since_ns >= kRecoveryWindowNs) {
++          data.recovery_time.add(now_ns - record.rec_since_ns);
++          setInputStateLocked(input, InputAvailability::kHealthy, now_ns);
++        }
++        break;
++      case InputAvailability::kStale:
++        break;
++    }
++  }
++  updateAggregateLocked(now_ns);
++}
++
++void InputAvailabilityMonitor::recordObserverCost(const std::int64_t cost_ns) {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  observer_cost_.add(cost_ns);
++}
++
++void InputAvailabilityMonitor::drainTransitions(TransitionLog& log) {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  log.count = pending_.count;
++  for (std::size_t index = 0; index < pending_.count; ++index) {
++    log.records.at(index) = pending_.records.at(index);
++  }
++  pending_.count = 0;
++}
++
++void InputAvailabilityMonitor::snapshot(Snapshot& snapshot) const {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  snapshot.input_count = input_count_;
++  snapshot.min_inputs = min_inputs_;
++  snapshot.timeout_ns = timeout_ns_;
++  snapshot.epoch_ns = epoch_ns_;
++  snapshot.aggregate = aggregate_;
++  snapshot.aggregate_transitions = aggregate_transitions_;
++  snapshot.time_jumps = time_jumps_;
++  snapshot.transitions_dropped = transitions_dropped_;
++  snapshot.observer_cost = observer_cost_;
++  for (std::size_t input = 0; input < input_count_; ++input) {
++    snapshot.inputs.at(input) = inputs_.at(input).data;
++  }
++}
++
++InputAvailability InputAvailabilityMonitor::inputState(const std::size_t input) const {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  return inputs_.at(input).data.state;
++}
++
++AggregateAvailability InputAvailabilityMonitor::aggregateState() const {
++  const std::lock_guard<std::mutex> lock(mutex_);
++  return aggregate_;
++}
++
++void InputAvailabilityMonitor::anchorEpochLocked(const std::int64_t now_ns) {
++  if (epoch_pending_) {
++    epoch_ns_ = now_ns;
++    epoch_pending_ = false;
++  }
++}
++
++void InputAvailabilityMonitor::setInputStateLocked(const std::size_t input,
++                                                   const InputAvailability next,
++                                                   const std::int64_t now_ns) {
++  InputSnapshot& data = inputs_.at(input).data;
++  if (data.state == next) {
++    return;
++  }
++  ++data.transitions.at(static_cast<std::size_t>(data.state)).at(static_cast<std::size_t>(next));
++  Transition transition;
++  transition.input = input;
++  transition.input_from = data.state;
++  transition.input_to = next;
++  transition.time_ns = now_ns;
++  logTransitionLocked(transition);
++  data.state = next;
++}
++
++void InputAvailabilityMonitor::updateAggregateLocked(const std::int64_t now_ns) {
++  std::size_t available = 0;
++  for (std::size_t input = 0; input < input_count_; ++input) {
++    const InputAvailability state = inputs_.at(input).data.state;
++    if (state == InputAvailability::kHealthy || state == InputAvailability::kUnknown) {
++      ++available;
++    }
++  }
++  AggregateAvailability next = AggregateAvailability::kInsufficient;
++  if (available == input_count_) {
++    next = AggregateAvailability::kNominal;
++  } else if (available >= min_inputs_) {
++    next = AggregateAvailability::kDegraded;
++  }
++  if (next == aggregate_) {
++    return;
++  }
++  ++aggregate_transitions_.at(static_cast<std::size_t>(aggregate_)).at(static_cast<std::size_t>(next));
++  Transition transition;
++  transition.aggregate = true;
++  transition.aggregate_from = aggregate_;
++  transition.aggregate_to = next;
++  transition.time_ns = now_ns;
++  logTransitionLocked(transition);
++  aggregate_ = next;
++}
++
++void InputAvailabilityMonitor::logTransitionLocked(const Transition& transition) {
++  if (pending_.count < kTransitionCapacity) {
++    pending_.records.at(pending_.count) = transition;
++    ++pending_.count;
++  } else {
++    ++transitions_dropped_;
++  }
++}
++
++void InputAvailabilityMonitor::resetLocked(const std::int64_t now_ns) {
++  for (std::size_t input = 0; input < input_count_; ++input) {
++    InputRecord& record = inputs_.at(input);
++    setInputStateLocked(input, InputAvailability::kUnknown, now_ns);
++    record.data.last_arrival_ns = 0;
++    record.rec_since_ns = 0;
++    record.last_stamp_ns = 0;
++    record.has_arrival = false;
++    record.has_stamp = false;
++  }
++  epoch_ns_ = now_ns;
++  epoch_pending_ = now_ns == 0;
++  has_tick_ = false;
++  last_tick_ns_ = 0;
++  updateAggregateLocked(now_ns);
++}
++
++}  // namespace point_cloud_fusion
+diff --git a/point_cloud_fusion/src/point_cloud_fusion.cpp b/point_cloud_fusion/src/point_cloud_fusion.cpp
+index b9a62a9..b8a8593 100644
+--- a/point_cloud_fusion/src/point_cloud_fusion.cpp
++++ b/point_cloud_fusion/src/point_cloud_fusion.cpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <chrono>
++#include <cinttypes>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -308,6 +309,16 @@ PointCloudFusion::PointCloudFusion(const rclcpp::NodeOptions& options) : Node("p
+                                 100.0,                                           // to_value
+                                 std::nullopt,                                    // step_value
+                                 "Valid range is [0, 100].");                     // additional_constraints
++  this->declareAndLoadParameter("degraded_mode.input_timeout", input_timeout_sec_,  // name
++                                "Time without messages after which an input is considered unavailable [s]; "
++                                "currently only monitored, it does not change the output",
++                                false,                                           // add_to_auto_reconfigurable_params
++                                false,                                           // is_required
++                                true,                                            // read_only
++                                kMinInputTimeoutSec,                             // from_value
++                                kMaxInputTimeoutSec,                             // to_value
++                                std::nullopt,                                    // step_value
++                                "Valid range is [0.01, 10]. The default is provisional.");  // additional_constraints
+   this->declareAndLoadParameter(
+       "feature_calibration.enable",
+       feature_calibration_enable_,                                               // name
+@@ -763,6 +774,12 @@ void PointCloudFusion::setup() {
+                 input_transport_hints_.size(), input_topics_.size(), kDefaultTransportHint);
+   }
+ 
++  // Passive input availability monitor: created before the subscribers, so the arrival observers registered
++  // below never see it uninitialized. Its epoch (startup grace) starts now.
++  availability_monitor_ = std::make_unique<InputAvailabilityMonitor>(
++      input_topics_.size(), static_cast<std::int64_t>(std::llround(input_timeout_sec_ * 1e9)));
++  availability_monitor_->reset(this->get_clock()->now().nanoseconds());
++
+   // create subscribers
+   cloud_subscribers_.clear();
+   cloud_subscriber_callback_groups_.clear();
+@@ -785,6 +802,8 @@ void PointCloudFusion::setup() {
+     // remains compatible with reliable publishers, so it also supports mixed
+     // sensor setups (for example, best-effort Aeva and reliable Ouster).
+     subscriber->subscribe(this->shared_from_this(), resolved, hint, rmw_qos_profile_sensor_data, subscription_options);
++    // Registered before any synchronizer callback, so it observes every message first; const access only.
++    subscriber->registerCallback([this, i](const PointCloudMsg::ConstSharedPtr& msg) { observeInputArrival(i, msg); });
+     RCLCPP_INFO(this->get_logger(), "Subscribed to '%s' (hint=%s)", subscriber->getTopic().c_str(), hint.c_str());
+     cloud_subscriber_callback_groups_.push_back(std::move(callback_group));
+     cloud_subscribers_.push_back(std::move(subscriber));
+@@ -861,6 +880,74 @@ void PointCloudFusion::setup() {
+     }
+   }
+   TRACETOOLS_TRACEPOINT(message_link_partial_sync, link_subs.data(), link_subs.size(), link_pubs.data(), link_pubs.size());
++
++  // Periodic availability evaluation on the node clock (ROS time), in its own callback group. Created last, once
++  // the complete subscription and synchronization topology exists.
++  availability_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
++  availability_timer_ =
++      this->create_timer(kAvailabilityEvaluationPeriod, [this]() { evaluateInputAvailability(); }, availability_callback_group_);
++}
++
++void PointCloudFusion::observeInputArrival(const std::size_t input, const PointCloudMsg::ConstSharedPtr& msg) {
++  const auto start = std::chrono::steady_clock::now();
++  const std::int64_t now_ns = this->get_clock()->now().nanoseconds();
++  const std::int64_t stamp_ns = msg ? rclcpp::Time(msg->header.stamp).nanoseconds() : 0;
++  availability_monitor_->onArrival(input, now_ns, stamp_ns);
++  availability_monitor_->recordObserverCost(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++}
++
++void PointCloudFusion::evaluateInputAvailability() {
++  const std::int64_t now_ns = this->get_clock()->now().nanoseconds();
++  availability_monitor_->onTick(now_ns);
++  availability_monitor_->drainTransitions(availability_transitions_);
++  for (std::size_t index = 0; index < availability_transitions_.count; ++index) {
++    const auto& transition = availability_transitions_.records.at(index);
++    if (transition.aggregate) {
++      RCLCPP_DEBUG(this->get_logger(), "Input availability: %s -> %s", toString(transition.aggregate_from),
++                   toString(transition.aggregate_to));
++    } else {
++      RCLCPP_DEBUG(this->get_logger(), "Input availability: input %zu ('%s') %s -> %s", transition.input,
++                   input_topics_.at(transition.input).c_str(), toString(transition.input_from), toString(transition.input_to));
++    }
++  }
++
++  const bool debug_enabled = rcutils_logging_logger_is_enabled_for(this->get_logger().get_name(), RCUTILS_LOG_SEVERITY_DEBUG);
++  if (debug_enabled &&
++      (now_ns < availability_last_summary_ns_ || now_ns - availability_last_summary_ns_ >= kAvailabilitySummaryPeriodNs)) {
++    availability_last_summary_ns_ = now_ns;
++    logInputAvailabilitySummary();
++  }
++}
++
++void PointCloudFusion::logInputAvailabilitySummary() {
++  availability_monitor_->snapshot(availability_snapshot_);
++  const auto& snapshot = availability_snapshot_;
++  const auto to_ms = [](const std::int64_t ns) { return static_cast<double>(ns) * 1e-6; };
++  const auto to_us = [](const std::int64_t ns) { return static_cast<double>(ns) * 1e-3; };
++  RCLCPP_DEBUG(this->get_logger(),
++               "Input availability summary: %s, inputs=%zu, min_inputs=%zu, timeout=%.0f ms, time_jumps=%" PRIu64
++               ", dropped_transitions=%" PRIu64 ", observer cost [us] p50=%.1f p99=%.1f max=%.1f (n=%" PRIu64 ")",
++               toString(snapshot.aggregate), snapshot.input_count, snapshot.min_inputs, to_ms(snapshot.timeout_ns),
++               snapshot.time_jumps, snapshot.transitions_dropped, to_us(snapshot.observer_cost.quantileUpperBound(0.5)),
++               to_us(snapshot.observer_cost.quantileUpperBound(0.99)), to_us(snapshot.observer_cost.max()),
++               snapshot.observer_cost.count());
++  for (std::size_t input = 0; input < snapshot.input_count; ++input) {
++    const auto& data = snapshot.inputs.at(input);
++    RCLCPP_DEBUG(this->get_logger(),
++                 "Input availability [%zu] '%s': %s, arrivals=%" PRIu64 " (before clock %" PRIu64 ", clamped %" PRIu64
++                 "); gap [ms] n=%" PRIu64 " p50=%.1f p99=%.1f p99.9=%.1f max=%.1f; silence n=%" PRIu64
++                 " max=%.1f ms; detect n=%" PRIu64 " max=%.1f ms; recovery n=%" PRIu64
++                 " max=%.1f ms; stamp gap p50=%.1f "
++                 "max=%.1f ms, zero=%" PRIu64 " repeat=%" PRIu64 " regress=%" PRIu64,
++                 input, input_topics_.at(input).c_str(), toString(data.state), data.arrivals, data.arrivals_before_clock,
++                 data.arrival_clamps, data.normal_gap.count(), to_ms(data.normal_gap.quantileUpperBound(0.5)),
++                 to_ms(data.normal_gap.quantileUpperBound(0.99)), to_ms(data.normal_gap.quantileUpperBound(0.999)),
++                 to_ms(data.normal_gap.max()), data.silence.count(), to_ms(data.silence.max()), data.detect_latency.count(),
++                 to_ms(data.detect_latency.max()), data.recovery_time.count(), to_ms(data.recovery_time.max()),
++                 to_ms(data.stamp_gap.quantileUpperBound(0.5)), to_ms(data.stamp_gap.max()), data.stamp_zero, data.stamp_repeats,
++                 data.stamp_regressions);
++  }
+ }
+ 
+ template <std::size_t N>
+diff --git a/point_cloud_fusion/test/test_input_availability.cpp b/point_cloud_fusion/test/test_input_availability.cpp
+new file mode 100644
+index 0000000..329c5d1
+--- /dev/null
++++ b/point_cloud_fusion/test/test_input_availability.cpp
+@@ -0,0 +1,383 @@
++// Copyright Institute for Automotive Engineering (ika), RWTH Aachen University
++// SPDX-License-Identifier: Apache-2.0
++
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <stdexcept>
++#include <utility>
++#include <vector>
++
++#include <point_cloud_fusion/input_availability.hpp>
++
++namespace {
++
++using point_cloud_fusion::AggregateAvailability;
++using point_cloud_fusion::DurationHistogram;
++using point_cloud_fusion::InputAvailability;
++using point_cloud_fusion::InputAvailabilityMonitor;
++
++/**
++ * @brief Convert milliseconds to nanoseconds.
++ *
++ * @param milliseconds Duration in milliseconds.
++ * @return Duration in nanoseconds.
++ */
++constexpr std::int64_t ms(const std::int64_t milliseconds) { return milliseconds * 1'000'000; }
++
++constexpr std::int64_t kTimeout = ms(300);
++
++TEST(InputAvailabilityMonitor, RejectsInvalidConfiguration) {
++  EXPECT_THROW(InputAvailabilityMonitor(0, kTimeout), std::invalid_argument);
++  EXPECT_THROW(InputAvailabilityMonitor(InputAvailabilityMonitor::kMaxInputs + 1, kTimeout), std::invalid_argument);
++  EXPECT_THROW(InputAvailabilityMonitor(2, 0), std::invalid_argument);
++  EXPECT_EQ(InputAvailabilityMonitor::defaultMinInputs(1), 1U);
++  EXPECT_EQ(InputAvailabilityMonitor::defaultMinInputs(2), 1U);
++  EXPECT_EQ(InputAvailabilityMonitor::defaultMinInputs(4), 2U);
++  EXPECT_EQ(InputAvailabilityMonitor::defaultMinInputs(9), 5U);
++}
++
++// T1: one global epoch; UNKNOWN counts as available until the startup grace T has passed.
++TEST(InputAvailabilityMonitor, StartupGraceUsesOneGlobalEpoch) {
++  InputAvailabilityMonitor monitor(4, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onTick(ms(1300));
++  for (std::size_t input = 0; input < 4; ++input) {
++    EXPECT_EQ(monitor.inputState(input), InputAvailability::kUnknown);
++  }
++  EXPECT_EQ(monitor.aggregateState(), AggregateAvailability::kNominal);
++
++  monitor.onTick(ms(1310));
++  for (std::size_t input = 0; input < 4; ++input) {
++    EXPECT_EQ(monitor.inputState(input), InputAvailability::kStale);
++  }
++  EXPECT_EQ(monitor.aggregateState(), AggregateAvailability::kInsufficient);
++}
++
++// T2: HEALTHY -> STALE at the first tick with now - last_arrival > T; the detection latency is recorded.
++TEST(InputAvailabilityMonitor, DetectsSilenceAtFirstTickPastTimeout) {
++  InputAvailabilityMonitor monitor(2, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onArrival(0, ms(1100), ms(1100));
++  monitor.onArrival(1, ms(1100), ms(1100));
++  monitor.onTick(ms(1400));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kHealthy);
++
++  monitor.onTick(ms(1410));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kStale);
++  EXPECT_EQ(monitor.inputState(1), InputAvailability::kStale);
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.inputs.at(0).detect_latency.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).detect_latency.max(), ms(310));
++}
++
++// T3: STALE -> RECOVERING on arrival, HEALTHY after 500 ms of arrivals, back to STALE on a gap > T while recovering.
++TEST(InputAvailabilityMonitor, RecoversAfterWindowAndFallsBackOnSilence) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(ms(1000));
++  for (std::int64_t t = ms(1000); t <= ms(2000); t += ms(100)) {
++    monitor.onArrival(0, t, t);
++  }
++  monitor.onTick(ms(2310));
++  ASSERT_EQ(monitor.inputState(0), InputAvailability::kStale);
++
++  monitor.onArrival(0, ms(3000), ms(3000));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kRecovering);
++  for (std::int64_t t = ms(3100); t < ms(3500); t += ms(100)) {
++    monitor.onArrival(0, t, t);
++    monitor.onTick(t + ms(5));
++    EXPECT_EQ(monitor.inputState(0), InputAvailability::kRecovering);
++  }
++  monitor.onArrival(0, ms(3500), ms(3500));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kHealthy);
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.inputs.at(0).silence.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).silence.max(), ms(1000));
++  EXPECT_EQ(snapshot.inputs.at(0).recovery_time.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).recovery_time.max(), ms(500));
++
++  monitor.onTick(ms(3810));
++  ASSERT_EQ(monitor.inputState(0), InputAvailability::kStale);
++  monitor.onArrival(0, ms(5000), ms(5000));
++  ASSERT_EQ(monitor.inputState(0), InputAvailability::kRecovering);
++  monitor.onTick(ms(5310));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kStale);
++}
++
++// T4: aggregate mapping with the default minimum (1 for N <= 2, otherwise ceil(N / 2)).
++TEST(InputAvailabilityMonitor, AggregateUsesDefaultMinimum) {
++  for (const std::size_t input_count : {std::size_t{2}, std::size_t{4}, std::size_t{9}}) {
++    const std::size_t min_inputs = InputAvailabilityMonitor::defaultMinInputs(input_count);
++    for (std::size_t alive = 0; alive <= input_count; ++alive) {
++      InputAvailabilityMonitor monitor(input_count, kTimeout);
++      monitor.reset(ms(1000));
++      for (std::size_t input = 0; input < input_count; ++input) {
++        monitor.onArrival(input, ms(1000), ms(1000));
++      }
++      for (std::size_t input = 0; input < alive; ++input) {
++        monitor.onArrival(input, ms(1200), ms(1200));
++      }
++      monitor.onTick(ms(1310));
++      AggregateAvailability expected = AggregateAvailability::kInsufficient;
++      if (alive == input_count) {
++        expected = AggregateAvailability::kNominal;
++      } else if (alive >= min_inputs) {
++        expected = AggregateAvailability::kDegraded;
++      }
++      EXPECT_EQ(monitor.aggregateState(), expected) << "N=" << input_count << " alive=" << alive;
++    }
++  }
++}
++
++// RECOVERING inputs are not counted as available until they are HEALTHY again.
++TEST(InputAvailabilityMonitor, RecoveringInputIsNotCountedAsAvailable) {
++  InputAvailabilityMonitor monitor(2, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onArrival(0, ms(1000), ms(1000));
++  monitor.onArrival(1, ms(1000), ms(1000));
++  monitor.onArrival(0, ms(1200), ms(1200));
++  monitor.onTick(ms(1310));
++  ASSERT_EQ(monitor.aggregateState(), AggregateAvailability::kDegraded);
++  monitor.onArrival(1, ms(1400), ms(1400));
++  EXPECT_EQ(monitor.inputState(1), InputAvailability::kRecovering);
++  EXPECT_EQ(monitor.aggregateState(), AggregateAvailability::kDegraded);
++}
++
++// T5: a backward jump seen by onTick() starts a new epoch.
++TEST(InputAvailabilityMonitor, BackwardTickStartsNewEpoch) {
++  InputAvailabilityMonitor monitor(2, kTimeout);
++  monitor.reset(ms(5000));
++  monitor.onArrival(0, ms(5100), ms(5100));
++  monitor.onTick(ms(5200));
++  monitor.onTick(ms(4000));
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.time_jumps, 1U);
++  EXPECT_EQ(snapshot.epoch_ns, ms(4000));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kUnknown);
++  EXPECT_EQ(monitor.inputState(1), InputAvailability::kUnknown);
++  EXPECT_EQ(monitor.aggregateState(), AggregateAvailability::kNominal);
++
++  monitor.onTick(ms(4300));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kUnknown);
++  monitor.onTick(ms(4310));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kStale);
++}
++
++// T6: an arrival that read the clock before the last tick or before the last arrival never resets the state.
++TEST(InputAvailabilityMonitor, LateArrivalNeverResets) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onArrival(0, ms(2000), 1);
++  monitor.onTick(ms(2050));
++  monitor.onArrival(0, ms(2040), 2);
++  monitor.onArrival(0, ms(1990), 3);
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.time_jumps, 0U);
++  EXPECT_EQ(snapshot.inputs.at(0).arrival_clamps, 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).normal_gap.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).last_arrival_ns, ms(2040));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kHealthy);
++}
++
++// T7: a gap that crossed STALE is a silence, not a normal gap.
++TEST(InputAvailabilityMonitor, SeparatesSilenceFromNormalGaps) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onArrival(0, ms(1000), 1);
++  monitor.onArrival(0, ms(1100), 2);
++  monitor.onTick(ms(1410));
++  monitor.onArrival(0, ms(2000), 3);
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.inputs.at(0).normal_gap.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).normal_gap.max(), ms(100));
++  EXPECT_EQ(snapshot.inputs.at(0).silence.count(), 1U);
++  EXPECT_EQ(snapshot.inputs.at(0).silence.max(), ms(900));
++}
++
++// T8: header stamps feed counters and the stamp histogram only.
++TEST(InputAvailabilityMonitor, HeaderStampPolicyDoesNotAffectAvailability) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(ms(1000));
++  monitor.onArrival(0, ms(1000), 0);
++  monitor.onArrival(0, ms(1100), ms(50));
++  monitor.onArrival(0, ms(1200), ms(150));
++  monitor.onArrival(0, ms(1300), ms(150));
++  monitor.onArrival(0, ms(1400), ms(90));
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  const auto& input = snapshot.inputs.at(0);
++  EXPECT_EQ(input.stamp_zero, 1U);
++  EXPECT_EQ(input.stamp_repeats, 1U);
++  EXPECT_EQ(input.stamp_regressions, 1U);
++  EXPECT_EQ(input.stamp_gap.count(), 1U);
++  EXPECT_EQ(input.normal_gap.count(), 4U);
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kHealthy);
++}
++
++// T9: a full transition log drops records only; state and transition counters stay complete.
++TEST(InputAvailabilityMonitor, TransitionOverflowDropsRecordsOnly) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(ms(1000));
++  std::int64_t now = ms(1000);
++  monitor.onArrival(0, now, now);
++  constexpr int kCycles = 40;
++  for (int cycle = 0; cycle < kCycles; ++cycle) {
++    now += ms(310);
++    monitor.onTick(now);
++    now += ms(10);
++    monitor.onArrival(0, now, now);
++  }
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kRecovering);
++
++  InputAvailabilityMonitor::TransitionLog log;
++  monitor.drainTransitions(log);
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  const auto& counts = snapshot.inputs.at(0).transitions;
++  std::uint64_t input_transitions = 0;
++  for (const auto& row : counts) {
++    for (const auto value : row) {
++      input_transitions += value;
++    }
++  }
++  std::uint64_t aggregate_transitions = 0;
++  for (const auto& row : snapshot.aggregate_transitions) {
++    for (const auto value : row) {
++      aggregate_transitions += value;
++    }
++  }
++  EXPECT_EQ(log.count, InputAvailabilityMonitor::kTransitionCapacity);
++  EXPECT_EQ(snapshot.transitions_dropped + log.count, input_transitions + aggregate_transitions);
++  EXPECT_GT(snapshot.transitions_dropped, 0U);
++
++  monitor.drainTransitions(log);
++  EXPECT_EQ(log.count, 0U);
++}
++
++// ROS time without /clock reads 0: such arrivals are only counted, and the epoch starts at the first non-zero time.
++TEST(InputAvailabilityMonitor, EpochWaitsForClockToStart) {
++  InputAvailabilityMonitor monitor(1, kTimeout);
++  monitor.reset(0);
++  monitor.onArrival(0, 0, 0);
++  monitor.onTick(0);
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kUnknown);
++
++  monitor.onTick(ms(100'000));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kUnknown);
++  monitor.onTick(ms(100'300));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kUnknown);
++  monitor.onTick(ms(100'310));
++  EXPECT_EQ(monitor.inputState(0), InputAvailability::kStale);
++
++  InputAvailabilityMonitor::Snapshot snapshot;
++  monitor.snapshot(snapshot);
++  EXPECT_EQ(snapshot.inputs.at(0).arrivals_before_clock, 1U);
++  EXPECT_EQ(snapshot.epoch_ns, ms(100'000));
++}
++
++/**
++ * @brief One expected transition: time, input index (-1 for aggregate), and target state name.
++ */
++struct ExpectedTransition {
++  std::int64_t time_ns;
++  int input;
++  const char* to;
++};
++
++// Same rules as the validated Python model (phase2f Level0F, T = 300 ms, window recovery, 10 ms ticks): the
++// expected transitions below were produced by that model for the same scripted trace (times shifted by +1 s
++// because 0 means "clock not started" here).
++TEST(InputAvailabilityMonitor, MatchesReferenceModelOnScriptedTrace) {
++  constexpr std::int64_t kOffset = ms(1000);
++  constexpr std::int64_t kTick = ms(10);
++  std::vector<std::pair<std::int64_t, std::size_t>> arrivals;
++  for (std::int64_t k = 0; k < 60; ++k) {
++    const std::int64_t t = ms(50) + k * ms(100);
++    arrivals.emplace_back(t, 0);
++    if (t + ms(3) < ms(2000) || t + ms(3) >= ms(3200)) {
++      arrivals.emplace_back(t + ms(3), 1);
++    }
++    if (t + ms(7) >= ms(950) && (t + ms(7) < ms(4000) || t + ms(7) >= ms(4250))) {
++      arrivals.emplace_back(t + ms(7), 2);
++    }
++  }
++  std::sort(arrivals.begin(), arrivals.end());
++
++  InputAvailabilityMonitor monitor(3, kTimeout);
++  monitor.reset(kOffset);
++  std::vector<ExpectedTransition> observed;
++  InputAvailabilityMonitor::TransitionLog log;
++  const auto collect = [&]() {
++    monitor.drainTransitions(log);
++    for (std::size_t index = 0; index < log.count; ++index) {
++      const auto& transition = log.records.at(index);
++      observed.push_back({transition.time_ns - kOffset, transition.aggregate ? -1 : static_cast<int>(transition.input),
++                          transition.aggregate ? point_cloud_fusion::toString(transition.aggregate_to)
++                                               : point_cloud_fusion::toString(transition.input_to)});
++    }
++  };
++  std::int64_t tick = 0;
++  for (const auto& [time, input] : arrivals) {
++    while (tick < time) {
++      monitor.onTick(tick + kOffset);
++      collect();
++      tick += kTick;
++    }
++    monitor.onArrival(input, time + kOffset, time);
++    collect();
++  }
++  const std::int64_t end = arrivals.back().first + ms(1000);
++  while (tick <= end) {
++    monitor.onTick(tick + kOffset);
++    collect();
++    tick += kTick;
++  }
++
++  const std::vector<ExpectedTransition> expected = {
++      {ms(50), 0, "HEALTHY"},     {ms(53), 1, "HEALTHY"},      {ms(310), 2, "STALE"},     {ms(310), -1, "DEGRADED"},
++      {ms(957), 2, "RECOVERING"}, {ms(1457), 2, "HEALTHY"},    {ms(1457), -1, "NOMINAL"}, {ms(2260), 1, "STALE"},
++      {ms(2260), -1, "DEGRADED"}, {ms(3253), 1, "RECOVERING"}, {ms(3753), 1, "HEALTHY"},  {ms(3753), -1, "NOMINAL"},
++      {ms(6260), 0, "STALE"},     {ms(6260), 1, "STALE"},      {ms(6260), 2, "STALE"},    {ms(6260), -1, "INSUFFICIENT"},
++  };
++  ASSERT_EQ(observed.size(), expected.size());
++  for (std::size_t index = 0; index < expected.size(); ++index) {
++    EXPECT_EQ(observed.at(index).time_ns, expected.at(index).time_ns) << "transition " << index;
++    EXPECT_EQ(observed.at(index).input, expected.at(index).input) << "transition " << index;
++    EXPECT_STREQ(observed.at(index).to, expected.at(index).to) << "transition " << index;
++  }
++}
++
++TEST(DurationHistogram, QuantilesAreBucketUpperBoundsCappedAtMax) {
++  DurationHistogram histogram;
++  EXPECT_EQ(histogram.quantileUpperBound(0.5), 0);
++  for (int sample = 0; sample < 99; ++sample) {
++    histogram.add(ms(100));
++  }
++  histogram.add(ms(250));
++  histogram.add(-1);
++  EXPECT_EQ(histogram.count(), 100U);
++  EXPECT_EQ(histogram.max(), ms(250));
++  const std::int64_t median = histogram.quantileUpperBound(0.5);
++  EXPECT_GE(median, ms(100));
++  EXPECT_LE(median, ms(110));
++  EXPECT_EQ(histogram.quantileUpperBound(1.0), ms(250));
++  EXPECT_EQ(DurationHistogram::bucketIndex(0), 0U);
++  EXPECT_EQ(DurationHistogram::bucketIndex(ms(1'000'000)), DurationHistogram::kBucketCount - 1);
++  for (std::size_t bucket = 1; bucket < DurationHistogram::kBucketCount; ++bucket) {
++    EXPECT_GT(DurationHistogram::bucketUpperBound(bucket), DurationHistogram::bucketUpperBound(bucket - 1));
++  }
++}
++
++}  // namespace
+diff --git a/point_cloud_fusion/test/test_observer_no_copy.cpp b/point_cloud_fusion/test/test_observer_no_copy.cpp
+new file mode 100644
+index 0000000..f0184ce
+--- /dev/null
++++ b/point_cloud_fusion/test/test_observer_no_copy.cpp
+@@ -0,0 +1,236 @@
++// Copyright Institute for Automotive Engineering (ika), RWTH Aachen University
++// SPDX-License-Identifier: Apache-2.0
++
++// The arrival observer adds one callback to every input filter, in front of the synchronizer. These tests check,
++// against the installed message_filters, that a const observer neither copies messages nor changes what the
++// approximate-time synchronizer outputs.
++
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <type_traits>
++#include <utility>
++#include <vector>
++
++#include <message_filters/simple_filter.h>
++#include <message_filters/sync_policies/approximate_time.h>
++#include <message_filters/synchronizer.h>
++#include <sensor_msgs/msg/point_cloud2.hpp>
++
++namespace {
++
++using Cloud = sensor_msgs::msg::PointCloud2;
++using CloudConstPtr = Cloud::ConstSharedPtr;
++
++/**
++ * @brief Input filter that forwards a shared pointer exactly like point_cloud_transport::SubscriberFilter::cb().
++ */
++class ForwardingFilter : public message_filters::SimpleFilter<Cloud> {
++ public:
++  /**
++   * @brief Signal one message to all registered callbacks.
++   *
++   * @param msg Message to forward.
++   */
++  void forward(const CloudConstPtr& msg) { this->signalMessage(msg); }
++};
++
++/**
++ * @brief Create a point cloud with a given header stamp and a width that identifies it.
++ *
++ * @param stamp_ns Header stamp in nanoseconds.
++ * @param id Value stored in width.
++ * @return New message.
++ */
++CloudConstPtr makeCloud(const std::int64_t stamp_ns, const std::uint32_t id) {
++  auto msg = std::make_shared<Cloud>();
++  msg->header.stamp.sec = static_cast<std::int32_t>(stamp_ns / 1'000'000'000);
++  msg->header.stamp.nanosec = static_cast<std::uint32_t>(stamp_ns % 1'000'000'000);
++  msg->header.frame_id = "sensor";
++  msg->height = 1;
++  msg->width = id;
++  return msg;
++}
++
++/**
++ * @brief Approximate-time policy with N point-cloud inputs.
++ *
++ * @tparam N Number of inputs (2 or 4).
++ */
++template <std::size_t N>
++struct PolicyFor;
++
++/** @brief Two inputs. */
++template <>
++struct PolicyFor<2> {
++  using Type = message_filters::sync_policies::ApproximateTime<Cloud, Cloud>;
++};
++
++/** @brief Four inputs. */
++template <>
++struct PolicyFor<4> {
++  using Type = message_filters::sync_policies::ApproximateTime<Cloud, Cloud, Cloud, Cloud>;
++};
++
++/**
++ * @brief Connect N filters to a synchronizer.
++ *
++ * @param sync Synchronizer.
++ * @param filters Input filters.
++ */
++template <std::size_t N, std::size_t... Is>
++void connectFilters(message_filters::Synchronizer<typename PolicyFor<N>::Type>& sync,
++                    std::array<ForwardingFilter, N>& filters,
++                    std::index_sequence<Is...> /*unused*/) {
++  sync.connectInput(std::get<Is>(filters)...);
++}
++
++/**
++ * @brief Collect the point clouds of one synchronizer callback, skipping unused slots.
++ *
++ * @param out Vector that receives the point-cloud pointers.
++ * @param msgs All callback arguments.
++ */
++template <typename... Args>
++void collectClouds(std::vector<CloudConstPtr>& out, const Args&... msgs) {
++  const auto append = [&out](const auto& msg) {
++    if constexpr (std::is_same_v<std::decay_t<decltype(msg)>, CloudConstPtr>) {
++      out.push_back(msg);
++    }
++  };
++  (append(msgs), ...);
++}
++
++// P2: with a const observer in front of the synchronizer on every input (so callbacks_.size() > 1 and
++// nonconst_force_copy is set), the observer and the synchronizer both receive the published object itself.
++TEST(ObserverNoCopy, ConstObserverAndSynchronizerReceiveThePublishedObject) {
++  using Policy = PolicyFor<2>::Type;
++  std::array<ForwardingFilter, 2> filters;
++  std::array<const Cloud*, 2> observed{nullptr, nullptr};
++  std::get<0>(filters).registerCallback([&observed](const CloudConstPtr& msg) { std::get<0>(observed) = msg.get(); });
++  std::get<1>(filters).registerCallback([&observed](const CloudConstPtr& msg) { std::get<1>(observed) = msg.get(); });
++
++  message_filters::Synchronizer<Policy> sync{Policy(10)};
++  connectFilters<2>(sync, filters, std::make_index_sequence<2>{});
++  std::vector<CloudConstPtr> synchronized;
++  sync.registerCallback([&synchronized](const auto&... msgs) { collectClouds(synchronized, msgs...); });
++
++  // Two complete sets; the second one makes the first one final.
++  const std::array<CloudConstPtr, 2> first{makeCloud(1'000'000'000, 1), makeCloud(1'001'000'000, 2)};
++  const std::array<CloudConstPtr, 2> second{makeCloud(1'100'000'000, 3), makeCloud(1'101'000'000, 4)};
++  for (std::size_t input = 0; input < 2; ++input) {
++    filters.at(input).forward(first.at(input));
++    EXPECT_EQ(observed.at(input), first.at(input).get()) << "observer, input " << input;
++  }
++  for (std::size_t input = 0; input < 2; ++input) {
++    filters.at(input).forward(second.at(input));
++  }
++
++  ASSERT_GE(synchronized.size(), 2U);
++  for (std::size_t input = 0; input < 2; ++input) {
++    EXPECT_EQ(synchronized.at(input).get(), first.at(input).get()) << "synchronizer, input " << input;
++  }
++  EXPECT_EQ(std::get<1>(observed), second.at(1).get());
++}
++
++// Negative control: a callback that asks for a mutable message receives a copy, while a const callback on the same
++// filter receives the original. This shows that the identity checks above would detect a copy.
++TEST(ObserverNoCopy, MutableCallbackReceivesACopy) {
++  ForwardingFilter filter;
++  const Cloud* const_seen = nullptr;
++  const Cloud* mutable_seen = nullptr;
++  filter.registerCallback([&const_seen](const CloudConstPtr& msg) { const_seen = msg.get(); });
++  filter.registerCallback(std::function<void(const std::shared_ptr<Cloud>&)>(
++      [&mutable_seen](const std::shared_ptr<Cloud>& msg) { mutable_seen = msg.get(); }));
++  const CloudConstPtr msg = makeCloud(1'000'000'000, 1);
++  filter.forward(msg);
++  EXPECT_EQ(const_seen, msg.get());
++  ASSERT_NE(mutable_seen, nullptr);
++  EXPECT_NE(mutable_seen, msg.get());
++}
++
++/**
++ * @brief Run a fixed trace with jitter, reordering and drops through an N-input synchronizer.
++ *
++ * @param with_observers Register a const observer in front of the synchronizer on every input.
++ * @return For every synchronizer output, the ids (widths) of its point clouds in input order.
++ */
++template <std::size_t N>
++std::vector<std::vector<std::uint32_t>> runTrace(const bool with_observers) {
++  using Policy = typename PolicyFor<N>::Type;
++  std::array<ForwardingFilter, N> filters;
++  std::uint64_t observed = 0;
++  if (with_observers) {
++    for (auto& filter : filters) {
++      filter.registerCallback([&observed](const CloudConstPtr& /*msg*/) { ++observed; });
++    }
++  }
++  message_filters::Synchronizer<Policy> sync{Policy(3)};
++  connectFilters<N>(sync, filters, std::make_index_sequence<N>{});
++  std::vector<std::vector<std::uint32_t>> outputs;
++  sync.registerCallback([&outputs](const auto&... msgs) {
++    std::vector<CloudConstPtr> clouds;
++    collectClouds(clouds, msgs...);
++    std::vector<std::uint32_t> ids;
++    ids.reserve(clouds.size());
++    for (const auto& cloud : clouds) {
++      ids.push_back(cloud->width);
++    }
++    outputs.push_back(ids);
++  });
++
++  // Deterministic trace: 10 Hz per input, stamp jitter +-20 ms, transport delay 0-30 ms, some drops.
++  struct Event {
++    std::int64_t arrival_ns;
++    std::size_t input;
++    CloudConstPtr msg;
++  };
++  std::vector<Event> events;
++  std::uint32_t state = 12345U;
++  const auto next = [&state](const std::uint32_t modulo) {
++    state = state * 1103515245U + 12345U;
++    return (state >> 16U) % modulo;
++  };
++  for (std::uint32_t cycle = 0; cycle < 200; ++cycle) {
++    for (std::size_t input = 0; input < N; ++input) {
++      const std::int64_t jitter_ns = (static_cast<std::int64_t>(next(41)) - 20) * 1'000'000;
++      const std::int64_t delay_ns = static_cast<std::int64_t>(next(31)) * 1'000'000;
++      const bool drop = next(13) == 0;
++      if (drop) {
++        continue;
++      }
++      const std::int64_t stamp_ns = 1'000'000'000 + static_cast<std::int64_t>(cycle) * 100'000'000 + jitter_ns;
++      const auto id = static_cast<std::uint32_t>(input * 1000 + cycle);
++      events.push_back({stamp_ns + delay_ns, input, makeCloud(stamp_ns, id)});
++    }
++  }
++  std::stable_sort(events.begin(), events.end(),
++                   [](const Event& lhs, const Event& rhs) { return lhs.arrival_ns < rhs.arrival_ns; });
++  for (const auto& event : events) {
++    filters.at(event.input).forward(event.msg);
++  }
++  if (with_observers) {
++    EXPECT_EQ(observed, events.size());
++  }
++  return outputs;
++}
++
++// P3-A: the synchronizer output is identical with and without the observers, for the same input sequence.
++TEST(ObserverNoCopy, ObserversDoNotChangeSynchronizerOutput) {
++  const auto baseline2 = runTrace<2>(false);
++  const auto observed2 = runTrace<2>(true);
++  EXPECT_GT(baseline2.size(), 100U);
++  EXPECT_EQ(observed2, baseline2);
++
++  const auto baseline4 = runTrace<4>(false);
++  const auto observed4 = runTrace<4>(true);
++  EXPECT_GT(baseline4.size(), 50U);
++  EXPECT_EQ(observed4, baseline4);
++}
++
++}  // namespace
+-- 
+2.43.0
+
